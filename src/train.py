@@ -3,13 +3,22 @@ from os.path import join
 
 import matplotlib.pyplot as plt
 import torch
+from ignite.engine import (create_supervised_evaluator,
+                           create_supervised_trainer)
+from ignite.engine.engine import Engine
+from ignite.engine.events import Events
+from ignite.handlers import ModelCheckpoint
+from ignite.metrics import Loss
+from ignite.utils import setup_logger
 from monai.data import DataLoader, Dataset
 from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
 from monai.networks.layers.factories import Norm
 from monai.networks.nets import UNet
 from monai.transforms import (Compose, EnsureChannelFirstD, EnsureTypeD,
                               LoadImageD, OrientationD)
 from monai.transforms.utility.dictionary import AddChannelD, LambdaD
+from monai.utils.enums import CommonKeys
 from monai.utils.misc import first, set_determinism
 from torch.optim import Adam
 
@@ -66,28 +75,29 @@ transforms_train = Compose([
     LoadImageD(keys),
     EnsureChannelFirstD(keys),
     OrientationD(keys=keys[2], axcodes='RAS'),
+
     EnsureTypeD(keys),
-    LambdaD(keys=[keys[0], keys[1]], func=lambda x: x.expand(1, 128, 128, 128))  # we are going to try to learn from one of the images first
+    LambdaD(keys=[keys[0], keys[1]], func=lambda x: x.expand(1, 128, 128, 128))  # we are going to try to learn from single image first
 ])
 
 trainds = Dataset(train_img_label_dict, transforms_train)
 trainloader = DataLoader(trainds, batch_size=BATCH_SZ, shuffle=True)
 
 valds = Dataset(val_img_label_dict, transforms_train)
-valloader = DataLoader(trainds, batch_size=BATCH_SZ, shuffle=True)
-for data in trainds:
-    print(data[keys[0]].shape, data[keys[1]].shape, data[keys[2]].shape)
-    plt.subplot(1, 3, 1)
-    plt.imshow(data[keys[0]][0, 64], cmap='gray')
-    plt.subplot(1, 3, 2)
-    plt.imshow(data[keys[1]][0, 64], cmap='gray')
-    plt.subplot(1, 3, 3)
-    plt.imshow(data[keys[2]][0, 64], cmap='gray')
-    plt.show()
-    plt.tight_layout()
-    plt.savefig('sample-data.jpg')
+valloader = DataLoader(valds, batch_size=BATCH_SZ, shuffle=True)
+# for data in trainds:
+#     print(data[keys[0]].shape, data[keys[1]].shape, data[keys[2]].shape)
+#     plt.subplot(1, 3, 1)
+#     plt.imshow(data[keys[0]][0, 64], cmap='gray')
+#     plt.subplot(1, 3, 2)
+#     plt.imshow(data[keys[1]][0, 64], cmap='gray')
+#     plt.subplot(1, 3, 3)
+#     plt.imshow(data[keys[2]][0, 64], cmap='gray')
+#     plt.show()
+#     plt.tight_layout()
+#     plt.savefig('sample-data.jpg')
 
-    break
+#     break
 
 
 model = UNet(3, 1, 1, channels, strides, num_res_units=num_res_units, norm=Norm.BATCH).to(device)
@@ -97,11 +107,52 @@ optimizer = Adam(model.parameters(), lr)
 
 batch = first(trainloader)
 image = batch[keys[0]].to(device)
-# image.expand(BATCH_SZ, 1, 128, 128, 128)
-label = batch[keys[1]].to(device)
+label = batch[keys[2]].to(device)
 print(f'batch image shape {image.shape} label shape {label.shape}')
 predicted_label = model(image)
 dice_loss = loss_function(predicted_label, label)
 print(f'Dice Loss {dice_loss.item():.3f}')
 plt.imshow(predicted_label[0, 0, 64].detach().cpu(), cmap='gray')
 plt.savefig('sample-prediction.jpg')
+
+
+iter_loss_values = list()
+val_loss_values = list()
+
+
+def prep_batch(batch, device, non_blocking):
+    return batch[keys[0]].to(device), batch[keys[2]].to(device)
+
+
+val_metrics = {
+    "dice_metric": Loss(loss_function)
+}
+
+trainer = create_supervised_trainer(model, optimizer, loss_function, device, prepare_batch=prep_batch)
+trainer.logger = setup_logger('trainer')
+evaluator = create_supervised_evaluator(model, val_metrics, device, True, prepare_batch=prep_batch)
+evaluator.logger = setup_logger('evaluator')
+
+
+@trainer.on(Events.ITERATION_COMPLETED)
+def log_iteration_loss(engine: Engine):
+    global step
+    loss = engine.state.output
+    iter_loss_values.append(loss)
+    print(f'epoch {engine.state.epoch}/ {engine.state.max_epochs} step {step} Training Dice Loss {loss:.3f}')
+    step += 1
+
+
+@trainer.on(Events.EPOCH_COMPLETED)
+def run_validation(engine: Engine):
+    evaluator.run(valloader)
+    val_loss_values.append(evaluator.state.metrics['dice_metric'])
+    print(f'epoch {engine.state.epoch} Validation MSE {val_loss_values[-1]:.3f}')
+
+
+checkpoint_handler = ModelCheckpoint('./TrainedModels', filename_prefix='Unet_DiceLoss_batchnorm', score_name='dice',
+                                     n_saved=1,
+                                     require_empty=False, score_function=lambda x: -iter_loss_values[-1])
+
+trainer.add_event_handler(event_name=Events.EPOCH_COMPLETED, handler=checkpoint_handler, to_save={'model': model})
+trainer.run(trainloader, num_epochs)
